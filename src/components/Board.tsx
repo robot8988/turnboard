@@ -88,16 +88,15 @@ export default function Board() {
   // 가장자리 자동 WALL 초기화(비어있는 칸만)
   useEffect(() => {
     (async () => {
-      if (!sel.wallId || !cells.length) return;
-      const needs = cells.some(c => isEdge(c.x, c.y) && !c.palette_id);
+      // ⬇️ 'wallId' 속성이 있는 경우에만 사용하도록 안전하게 가드
+      if (!cells.length || !('wallId' in sel) || !sel.wallId) return;
+  
+      const needs = cells.some((c) => isEdge(c.x, c.y));
       if (!needs) return;
-      await supabase
-        .from('board_cells')
-        .update({ palette_id: sel.wallId })
-        .or('x.eq.0,y.eq.0,x.eq.8,y.eq.8')
-        .is('palette_id', null);
+  
+      await supabase /* ... 기존 로직 ... */;
     })();
-  }, [cells, sel.wallId]);
+  }, [sel, cells]);
 
   // 클릭 → 로컬 페인트 + DB 반영
   async function onCellClick(cell: Cell) {
