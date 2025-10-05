@@ -1,0 +1,20 @@
+/* ↓↓↓ Tailwind 프리플라이트 + 유틸리티만 켭니다. (다른 전역 CSS 싹 제거) */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 안전한 기본 배경/글자색(원하면 지워도 됨) */
+html, body {
+  background: #f8fafc; /* 아주 연한 회색 */
+  color: #111827;      /* 거의 검정 */
+}
+
+/* 혹시 남아있던 디버그 CSS(전체 테두리/배경)를 무력화 */
+* {
+  outline: 0 !important;
+  box-sizing: border-box;
+}
+/* “모든 요소에 border 주는” 규칙이 남아있었다면 아래가 덮어씁니다 */
+*:not(button):not(input):not(select):not(textarea) {
+  border: 0 !important;
+}
