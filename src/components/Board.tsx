@@ -212,7 +212,7 @@ export default function Board() {
           {/* WALL / RESET – 아래 여백 강화 */}
           <div className="grid grid-cols-2 gap-4 mb-2">
             <button
-              onClick={() => setSel({ kind: 'wall', wallId: sel.wallId })}
+              onClick={() => setSel({ kind: 'wall', wallId: sel.kind === 'wall' ? sel.wallId : null })}
               className={`rounded-md border flex items-center justify-center text-lg font-semibold ${sel.kind==='wall' ? 'ring-2 ring-black' : ''}`}
               style={{ width: CELL, height: CELL, backgroundColor:'#111827', color:'#ffffff' }}
             >
