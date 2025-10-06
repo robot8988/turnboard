@@ -15,21 +15,21 @@ type Cell = {
 const CELL = 72;
 const BOARD_W = 9 * CELL + 16 + 4;
 
-// ✅ wall 모드까지 포함한 선택 상태 유니온 타입
-type Selected =
-  | { kind: 'wall'; wallId: string | null }
-  | { kind: 'reset' }
-  | { kind: 'image'; id: string; url: string };
+// ✅ 모드/선택을 분리해서 타입 충돌 제거
+type Mode = 'wall' | 'reset' | 'image';
 
 export default function Board() {
+  // 상태
   const [cells, setCells] = useState<Cell[]>([]);
   const [palettes, setPalettes] = useState<DBPalette[]>([]);
-  const [sel, setSel] = useState<Selected>({ kind: 'wall', wallId: null });
+  const [mode, setMode] = useState<Mode>('wall');
+  const [wallId, setWallId] = useState<string | null>(null);
+  const [imageSel, setImageSel] = useState<{ id: string; url: string } | null>(null);
   const [err, setErr] = useState<string>();
   const [paint, setPaint] = useState<Record<number, 'wall' | 'reset' | { url: string }>>({});
-  const [rt, setRt] = useState<RealtimeChannel | null>(null); // broadcast
+  const [rt, setRt] = useState<RealtimeChannel | null>(null);
 
-  // 개별 셀 재조회(조인 포함)
+  // 유틸
   async function refetchCell(id: number) {
     const { data, error } = await supabase
       .from('board_cells')
@@ -47,13 +47,13 @@ export default function Board() {
     }
   }
 
-  // ✅ WALL id 확보 (없으면 서버가 생성)
+  // ✅ WALL 팔레트 id 준비
   useEffect(() => {
     (async () => {
       try {
         const res = await fetch('/api/wall', { cache: 'no-store' });
         const j = await res.json();
-        if (res.ok) setSel({ kind: 'wall', wallId: j.id });
+        if (res.ok) setWallId(j.id ?? null);
         else setErr(j?.error || 'WALL 준비 실패');
       } catch (e: any) { setErr(e.message || 'WALL 준비 실패'); }
     })();
@@ -83,7 +83,7 @@ export default function Board() {
     return () => { alive = false; };
   }, []);
 
-  // DB Realtime – 보드 셀
+  // Realtime: cells
   useEffect(() => {
     const chCells = supabase
       .channel('cells')
@@ -106,7 +106,7 @@ export default function Board() {
       })
       .subscribe();
 
-    // DB Realtime – 팔레트
+    // Realtime: palettes
     const chPal = supabase
       .channel('palettes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'palette' }, async (p) => {
@@ -116,7 +116,7 @@ export default function Board() {
           .order('created_at', { ascending: false });
         setPalettes((data ?? []) as any);
 
-        // ✅ 팔레트 삭제/이미지 비움 즉시 반영
+        // 삭제/이미지 공백 즉시 반영
         if (p.eventType === 'DELETE') {
           const deletedId = (p.old as any)?.id as string | undefined;
           if (deletedId) {
@@ -163,7 +163,7 @@ export default function Board() {
     return () => { supabase.removeChannel(ch); };
   }, []);
 
-  // 9x9 기본 그리드
+  // 9x9 기본 그리드(초기 로딩 보임)
   const grid = useMemo(() => {
     if (cells.length) return [...cells];
     return Array.from({ length: 81 }).map((_, i) => {
@@ -174,46 +174,48 @@ export default function Board() {
 
   const isEdge = (x: number, y: number) => (x === 0 || y === 0 || x === 8 || y === 8);
 
-  // 가장자리 자동 WALL
+  // 가장자리 자동 WALL 채우기
   useEffect(() => {
     (async () => {
-      if (!cells.length || sel.kind !== 'wall' || !sel.wallId) return;
+      if (!cells.length || !wallId) return;
       const edgeIds = cells.filter(c => isEdge(c.x, c.y) && !c.palette_id).map(c => c.id);
       if (edgeIds.length === 0) return;
       const { error } = await supabase
         .from('board_cells')
-        .update({ palette_id: sel.wallId })
+        .update({ palette_id: wallId })
         .in('id', edgeIds);
       if (error) setErr(error.message);
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cells, sel]);
+  }, [cells, wallId]);
 
   // 셀 클릭
   async function onCellClick(cell: Cell) {
-    setPaint(p => ({ ...p, [cell.id]: sel.kind === 'image' ? { url: (sel as any).url } : sel.kind }));
+    setPaint(p => ({
+      ...p,
+      [cell.id]: mode === 'image'
+        ? { url: imageSel?.url || '' }
+        : mode
+    }));
     if (cell.id < 0) return;
 
     try {
-      if (sel.kind === 'reset') {
+      if (mode === 'reset') {
         const { error } = await supabase.from('board_cells').update({ palette_id: null }).eq('id', cell.id);
         if (error) throw error;
-        rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
-      } else if (sel.kind === 'wall') {
-        if (!sel.wallId) return;
-        const { error: e2 } = await supabase.from('board_cells').update({ palette_id: sel.wallId }).eq('id', cell.id);
-        if (e2) throw e2;
-        rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
-      } else {
-        const imgSel = sel as { id: string; url: string };
-        const { error: e2 } = await supabase.from('board_cells').update({ palette_id: imgSel.id }).eq('id', cell.id);
-        if (e2) throw e2;
-        rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
+      } else if (mode === 'wall') {
+        if (!wallId) return;
+        const { error } = await supabase.from('board_cells').update({ palette_id: wallId }).eq('id', cell.id);
+        if (error) throw error;
+      } else { // image
+        if (!imageSel) return;
+        const { error } = await supabase.from('board_cells').update({ palette_id: imageSel.id }).eq('id', cell.id);
+        if (error) throw error;
       }
+      rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
     } catch (e:any) { setErr(e.message || '업데이트 실패'); }
   }
 
-  // 버튼 스타일
+  // 렌더 스타일
   function cellStyle(cell: Cell): React.CSSProperties {
     const p = paint[cell.id];
     if (p) {
@@ -270,7 +272,7 @@ export default function Board() {
     }
   }
 
-  // 업로드 직후 즉시 반영
+  // 업로드 직후 반영
   function handleUploaded(p: UploadedPalette) {
     if (!p) return;
     setPalettes(prev => [p as DBPalette, ...prev]);
@@ -316,30 +318,23 @@ export default function Board() {
           </div>
 
           <div className="grid grid-cols-2 gap-4 mb-4">
-            {/* ✅ 깔끔한 토글: wall ↔ 유지 */}
             <button
-              onClick={() =>
-                setSel(prev => prev.kind === 'wall'
-                  ? { ...prev }
-                  : { kind: 'wall', wallId: sel.kind === 'wall' ? sel.wallId : (sel as any)?.wallId ?? sel.wallId ?? null })
-              }
-              className={`rounded-md border flex items-center justify-center text-lg font-semibold ${sel.kind==='wall' ? 'ring-2 ring-black' : ''}`}
+              onClick={() => setMode('wall')}
+              className={`rounded-md border flex items-center justify-center text-lg font-semibold ${mode==='wall' ? 'ring-2 ring-black' : ''}`}
               style={{ width: CELL, height: CELL, backgroundColor:'#111827', color:'#ffffff' }}
               title="가장자리/벽 칠하기"
             >
               WALL
             </button>
             <button
-              onClick={() => setSel({ kind: 'reset' })}
-              className={`rounded-md border flex items-center justify-center text-lg font-semibold bg-neutral-100 ${sel.kind==='reset' ? 'ring-2 ring-black' : ''}`}
+              onClick={() => setMode('reset')}
+              className={`rounded-md border flex items-center justify-center text-lg font-semibold bg-neutral-100 ${mode==='reset' ? 'ring-2 ring-black' : ''}`}
               style={{ width: CELL, height: CELL }}
               title="초기화"
             >
               RESET
             </button>
           </div>
-
-          <div className="h-2" />
 
           <div className="max-h-[520px] overflow-y-auto px-1 pt-2 pb-6 rounded-md bg-white/40">
             <div className="grid grid-cols-3 gap-4">
@@ -348,8 +343,8 @@ export default function Board() {
                 .map(p => (
                   <div key={p.id} className="relative" style={{ width: CELL, height: CELL }}>
                     <button
-                      onClick={() => p.image_url && setSel({ kind: 'image', id: p.id, url: p.image_url })}
-                      className={`rounded-md border overflow-hidden bg-white w-full h-full ${sel.kind==='image' && 'id' in sel && sel.id===p.id ? 'ring-2 ring-black' : ''}`}
+                      onClick={() => { if (p.image_url) { setMode('image'); setImageSel({ id: p.id, url: p.image_url }); }}}
+                      className={`rounded-md border overflow-hidden bg-white w-full h-full ${mode==='image' && imageSel?.id===p.id ? 'ring-2 ring-black' : ''}`}
                       style={{
                         backgroundImage: p.image_url ? `url(${p.image_url})` : undefined,
                         backgroundRepeat: 'no-repeat',
