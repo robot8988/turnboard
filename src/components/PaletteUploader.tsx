@@ -35,15 +35,12 @@ export default function PaletteUploader({ onUploaded }: Props) {
     }
   }
 
-  // ...생략...
   return (
-    <div className="mb-4">
+    <div className="mb-2">
       <input ref={fileRef} type="file" accept="image/*" onChange={onChange} disabled={busy} />
-      {/* ▼ 상태 문구 아래 여백을 더 크게 (mb-6) */}
-      <div className="text-sm text-gray-600 mt-1 mb-6">
+      <div className="text-sm text-gray-600 mt-2 mb-6">
         {busy ? '업로드 중…' : (msg ?? '선택된 파일 없음')}
       </div>
     </div>
   );
-
 }

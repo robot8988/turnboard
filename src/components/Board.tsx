@@ -1,6 +1,8 @@
 'use client';
+
 import { useEffect, useMemo, useState } from 'react';
-import { supabase } from '../lib/supabase';
+import type { RealtimeChannel } from '@supabase/supabase-js';
+import { supabase } from '@/lib/supabase';
 import PaletteUploader, { UploadedPalette } from './PaletteUploader';
 
 type DBPalette = { id: string; name: string | null; image_url: string | null };
@@ -24,18 +26,39 @@ export default function Board() {
   const [sel, setSel] = useState<Selected>({ kind: 'wall', wallId: null });
   const [err, setErr] = useState<string>();
   const [paint, setPaint] = useState<Record<number, 'wall' | 'reset' | { url: string }>>({});
+  const [rt, setRt] = useState<RealtimeChannel | null>(null); // broadcast
 
-  // WALL id 준비
+  // 유틸: 셀 1개 재조회(조인 포함)
+  async function refetchCell(id: number) {
+    const { data, error } = await supabase
+      .from('board_cells')
+      .select('id,x,y,palette_id, palette:palette_id (name,image_url)')
+      .eq('id', id)
+      .single();
+    if (!error && data) {
+      setCells(prev => {
+        const i = prev.findIndex(c => c.id === id);
+        if (i < 0) return prev;
+        const next = [...prev];
+        next[i] = data as any;
+        return next;
+      });
+    }
+  }
+
+  // WALL id 확보
   useEffect(() => {
     (async () => {
-      const res = await fetch('/api/wall', { cache: 'no-store' });
-      const j = await res.json();
-      if (res.ok) setSel({ kind: 'wall', wallId: j.id });
-      else setErr(j?.error || 'WALL 준비 실패');
+      try {
+        const res = await fetch('/api/wall', { cache: 'no-store' });
+        const j = await res.json();
+        if (res.ok) setSel({ kind: 'wall', wallId: j.id });
+        else setErr(j?.error || 'WALL 준비 실패');
+      } catch (e: any) { setErr(e.message || 'WALL 준비 실패'); }
     })();
   }, []);
 
-  // 데이터 로딩/구독
+  // 초기 로드
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -49,32 +72,102 @@ export default function Board() {
     })();
     (async () => {
       const { data, error } = await supabase
-        .from('palette').select('id,name,image_url').order('created_at', { ascending: false });
+        .from('palette')
+        .select('id,name,image_url')
+        .order('created_at', { ascending: false });
       if (!alive) return;
       if (error) setErr(error.message);
       setPalettes((data ?? []) as any);
     })();
-
-    const ch1 = supabase.channel('cells')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'board_cells' }, (p) => {
-        const n = p.new as any;
-        setCells(prev => {
-          const i = prev.findIndex(c => c.id === n.id);
-          if (i >= 0) { const next = [...prev]; next[i] = n; return next; }
-          return prev;
-        });
-      }).subscribe();
-
-    const ch2 = supabase.channel('palettes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'palette' }, async () => {
-        const { data } = await supabase.from('palette').select('id,name,image_url').order('created_at', { ascending: false });
-        setPalettes((data ?? []) as any);
-      }).subscribe();
-
-    return () => { supabase.removeChannel(ch1); supabase.removeChannel(ch2); alive = false; };
+    return () => { alive = false; };
   }, []);
 
-  // 빈 보드라도 9x9
+  // DB Realtime – 보드 셀 (조인 정보가 없으므로 해당 셀만 재조회)
+  useEffect(() => {
+    const chCells = supabase
+      .channel('cells')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'board_cells' }, (p) => {
+        const n = p.new as any as Cell;
+        // 새로 생긴 셀은 바로 반영(조인 필요 없으면 그대로, 필요하면 refetch)
+        setCells(prev => {
+          if (prev.some(c => c.id === n.id)) return prev;
+          return [...prev, n].sort((a,b)=> a.y-b.y || a.x-b.x);
+        });
+        refetchCell(n.id);
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'board_cells' }, (p) => {
+        const n = p.new as any as Cell;
+        // UPDATE는 조인 정보가 없음 → 해당 행만 재조회하여 확정 반영
+        refetchCell(n.id);
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'board_cells' }, (p) => {
+        const oldId = (p.old as any)?.id;
+        if (!oldId) return;
+        setCells(prev => prev.filter(c => c.id !== oldId));
+      })
+      .subscribe();
+
+    // DB Realtime – 팔레트(업로드/삭제/수정 시 목록 갱신)
+    const chPal = supabase
+      .channel('palettes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'palette' }, async (p) => {
+        // 목록 갱신
+        const { data } = await supabase
+          .from('palette')
+          .select('id,name,image_url')
+          .order('created_at', { ascending: false });
+        setPalettes((data ?? []) as any);
+
+        // 팔레트가 삭제되거나 이미지 경로가 사라진 경우, 해당 팔레트를 쓰던 셀들을 즉시 리렌더
+        if (p.eventType === 'DELETE') {
+          const deletedId = (p.old as any)?.id as string | undefined;
+          if (deletedId) {
+            setCells(prev => prev.map(c => c.palette_id === deletedId ? { ...c, palette_id: null, palette: null } : c));
+          }
+        }
+        if (p.eventType === 'UPDATE') {
+          const after = p.new as any;
+          if (!after?.image_url) {
+            // 이미지가 비워졌다면 그 팔레트를 쓰는 셀들의 표시도 흰색으로
+            const pid = after?.id as string | undefined;
+            if (pid) {
+              setCells(prev => prev.map(c => c.palette_id === pid ? { ...c, palette: { name: after?.name ?? null, image_url: null } } : c));
+            }
+          }
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(chCells);
+      supabase.removeChannel(chPal);
+    };
+  }, []);
+
+  // Broadcast – 탭 간 초즉시 반영
+  useEffect(() => {
+    const ch = supabase.channel('board-sync', { config: { broadcast: { self: false } } });
+
+    ch.on('broadcast', { event: 'cell:update' }, (msg) => {
+      const { id } = msg.payload as any;
+      // 브로드캐스트 수신 시에도 해당 셀을 재조회(조인 포함) → 확정 반영
+      refetchCell(id);
+    });
+
+    ch.on('broadcast', { event: 'palette:list:refresh' }, async () => {
+      const { data } = await supabase
+        .from('palette')
+        .select('id,name,image_url')
+        .order('created_at', { ascending: false });
+      setPalettes((data ?? []) as any);
+    });
+
+    ch.subscribe();
+    setRt(ch);
+    return () => { supabase.removeChannel(ch); };
+  }, []);
+
+  // 9x9 기본 그리드
   const grid = useMemo(() => {
     if (cells.length) return [...cells];
     return Array.from({ length: 81 }).map((_, i) => {
@@ -85,62 +178,60 @@ export default function Board() {
 
   const isEdge = (x: number, y: number) => (x === 0 || y === 0 || x === 8 || y === 8);
 
-  // 가장자리 자동 WALL 초기화(비어있는 칸만)
+  // 가장자리 자동 WALL
   useEffect(() => {
     (async () => {
-      // ⬇️ 'wallId' 속성이 있는 경우에만 사용하도록 안전하게 가드
-      if (!cells.length || !('wallId' in sel) || !sel.wallId) return;
-  
-      const needs = cells.some((c) => isEdge(c.x, c.y));
-      if (!needs) return;
-  
-      await supabase /* ... 기존 로직 ... */;
+      if (!cells.length || sel.kind !== 'wall' || !sel.wallId) return;
+      const edgeIds = cells.filter(c => isEdge(c.x, c.y) && !c.palette_id).map(c => c.id);
+      if (edgeIds.length === 0) return;
+      const { error } = await supabase
+        .from('board_cells')
+        .update({ palette_id: sel.wallId })
+        .in('id', edgeIds);
+      if (error) setErr(error.message);
     })();
-  }, [sel, cells]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cells, sel]);
 
-  // 클릭 → 로컬 페인트 + DB 반영
+  // 셀 클릭
   async function onCellClick(cell: Cell) {
-    setPaint(p => ({ ...p, [cell.id]: sel.kind === 'image' ? { url: sel.url } : sel.kind }));
+    setPaint(p => ({ ...p, [cell.id]: sel.kind === 'image' ? { url: (sel as any).url } : sel.kind }));
     if (cell.id < 0) return;
 
     try {
       if (sel.kind === 'reset') {
         const { error } = await supabase.from('board_cells').update({ palette_id: null }).eq('id', cell.id);
         if (error) throw error;
+        rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
       } else if (sel.kind === 'wall') {
         if (!sel.wallId) return;
-        const { error } = await supabase.from('board_cells').update({ palette_id: sel.wallId }).eq('id', cell.id);
-        if (error) throw error;
+        const { error: e2 } = await supabase.from('board_cells').update({ palette_id: sel.wallId }).eq('id', cell.id);
+        if (e2) throw e2;
+        rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
       } else {
-        const { error } = await supabase.from('board_cells').update({ palette_id: sel.id }).eq('id', cell.id);
-        if (error) throw error;
+        const imgSel = sel as { id: string; url: string };
+        const { error: e2 } = await supabase.from('board_cells').update({ palette_id: imgSel.id }).eq('id', cell.id);
+        if (e2) throw e2;
+        rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
       }
     } catch (e:any) { setErr(e.message || '업데이트 실패'); }
   }
 
-  // 버튼 자체에 배경을 그려 "칸 100% 채움"
+  // 버튼 스타일
   function cellStyle(cell: Cell): React.CSSProperties {
     const p = paint[cell.id];
-
-    // 로컬 페인트 우선
     if (p) {
-      if (p === 'reset') {
-        return { width: CELL, height: CELL, backgroundColor: '#ffffff' };
-      }
-      if (p === 'wall') {
-        return { width: CELL, height: CELL, backgroundColor: '#111827' };
-      }
+      if (p === 'reset') return { width: CELL, height: CELL, backgroundColor: '#ffffff' };
+      if (p === 'wall')  return { width: CELL, height: CELL, backgroundColor: '#111827' };
       return {
         width: CELL, height: CELL,
-        backgroundImage: `url(${p.url})`,
+        backgroundImage: `url(${(p as any).url})`,
         backgroundRepeat: 'no-repeat',
         backgroundSize: 'cover',
         backgroundPosition: 'center',
-        backgroundColor: '#ffffff'
+        backgroundColor: '#ffffff',
       };
     }
-
-    // DB 값
     if (cell.palette?.name?.toLowerCase() === 'wall') {
       return { width: CELL, height: CELL, backgroundColor: '#111827' };
     }
@@ -151,44 +242,70 @@ export default function Board() {
         backgroundRepeat: 'no-repeat',
         backgroundSize: 'cover',
         backgroundPosition: 'center',
-        backgroundColor: '#ffffff'
+        backgroundColor: '#ffffff',
       };
     }
-
-    // 기본
     return { width: CELL, height: CELL, backgroundColor: '#ffffff' };
   }
 
-  // 삭제
+  // 팔레트 삭제
   async function deletePalette(id: string) {
     const ok = confirm('이 이미지를 팔레트에서 삭제할까요? (보드에서 사용 중인 셀은 흰색으로 바뀝니다)');
     if (!ok) return;
-    const res = await fetch(`/api/palette/${id}`, { method: 'DELETE' });
-    const j = await res.json();
-    if (!res.ok) return alert(j?.error || '삭제 실패');
-    setPalettes(prev => prev.filter(p => p.id !== id)); // 즉시 제거
+   
+    try {
+      const res = await fetch(`/api/palette/${id}`, {
+        method: 'DELETE',
+        headers: { 'Accept': 'application/json' }, // JSON 기대를 명시
+      });
+  
+      // JSON이 아닐 수도 있으니 안전 파싱
+      const text = await res.text();
+      let json: any = null;
+      try { json = JSON.parse(text); } catch {
+        // 서버가 HTML(<!DOCTYPE …)을 돌려준 상황 → 에러로 처리
+        throw new Error(`API ${res.status}: ${text.slice(0, 200)}`);
+      }
+      if (!res.ok || json?.ok === false) {
+        throw new Error(json?.error || `API ${res.status}`);
+      }
+  
+      // 성공: 로컬/다른 탭 반영
+      setPalettes(prev => prev.filter(p => p.id !== id));
+      setCells(prev => prev.map(c => c.palette_id === id ? ({ ...c, palette_id: null, palette: null }) : c));
+      rt?.send({ type: 'broadcast', event: 'palette:list:refresh', payload: { at: Date.now() }});
+    } catch (e: any) {
+      alert(`삭제 실패: ${e.message}`);
+    }
   }
+
+
   // 업로드 직후 즉시 반영
   function handleUploaded(p: UploadedPalette) {
     if (!p) return;
     setPalettes(prev => [p as DBPalette, ...prev]);
+    rt?.send({ type: 'broadcast', event: 'palette:list:refresh', payload: { at: Date.now() }});
   }
 
   return (
     <div className="flex gap-10 items-start">
-      {/* 보드 + 중앙 제목만 남김 */}
+      {/* 보드 */}
       <section className="flex-1">
         <div style={{ width: BOARD_W }} className="mx-auto">
           <h1 className="text-3xl font-extrabold mb-4 text-center">
             &lt;3인용 어빌리티 4목 판&gt;
           </h1>
 
-          {err && <div className="mb-3 p-2 rounded bg-rose-100 text-rose-900 text-sm border border-rose-200">오류: {err}</div>}
+          {err && (
+            <div className="mb-4 p-3 rounded-lg bg-rose-100 text-rose-900 text-sm border border-rose-200">
+              오류: {err}
+            </div>
+          )}
 
           <div className="inline-grid grid-cols-9 gap-[2px] p-[2px] bg-neutral-400 rounded-md">
             {grid.map(cell => (
               <button
-                key={cell.id}
+                key={`${cell.id}-${cell.x}-${cell.y}`}
                 onClick={() => onCellClick(cell)}
                 className="relative border border-neutral-300/60"
                 style={cellStyle(cell)}
@@ -201,38 +318,36 @@ export default function Board() {
 
       {/* 팔레트 */}
       <aside className="w-[360px]">
-        <div className="border rounded-xl p-4 space-y-4">
-          <h3 className="text-2xl font-extrabold mb-4">팔레트</h3>
+        <div className="border rounded-2xl p-5 space-y-4">
+          <h3 className="text-2xl font-extrabold">팔레트</h3>
 
-          {/* 업로더 – 내부에서 상태문구 mb-6이 들어감 */}
-          <div>
+          <div className="pb-2 mb-4 border-b">
             <PaletteUploader onUploaded={handleUploaded} />
           </div>
 
-          {/* WALL / RESET – 아래 여백 강화 */}
-          <div className="grid grid-cols-2 gap-4 mb-2">
+          <div className="grid grid-cols-2 gap-4 mb-4">
             <button
-              onClick={() => setSel({ kind: 'wall', wallId: sel.kind === 'wall' ? sel.wallId : null })}
+              onClick={() => setSel({ kind: 'wall', wallId: sel.kind === 'wall' ? sel.wallId : (sel as any).wallId ?? sel.wallId })}
               className={`rounded-md border flex items-center justify-center text-lg font-semibold ${sel.kind==='wall' ? 'ring-2 ring-black' : ''}`}
               style={{ width: CELL, height: CELL, backgroundColor:'#111827', color:'#ffffff' }}
+              title="가장자리/벽 칠하기"
             >
               WALL
             </button>
             <button
               onClick={() => setSel({ kind: 'reset' })}
-              className={`rounded-md border flex items-center justify-center text-lg font-semibold bg-neutral-200 ${sel.kind==='reset' ? 'ring-2 ring-black' : ''}`}
+              className={`rounded-md border flex items-center justify-center text-lg font-semibold bg-neutral-100 ${sel.kind==='reset' ? 'ring-2 ring-black' : ''}`}
               style={{ width: CELL, height: CELL }}
+              title="초기화"
             >
               RESET
             </button>
           </div>
 
-          {/* ▼ WALL/RESET과 목록 사이 간격 확실히 띄우기 */}
-          <div className="h-4" />
+          <div className="h-2" />
 
-          {/* 업로드된 팔레트 – 목록 위쪽에 여백/패딩 보강(겹침 방지) */}
-          <div className="max-h-[460px] overflow-y-auto pr-1 mt-2 pt-4">
-            <div className="grid grid-cols-3 gap-3">
+          <div className="max-h-[520px] overflow-y-auto px-1 pt-2 pb-6 rounded-md bg-white/40">
+            <div className="grid grid-cols-3 gap-4">
               {palettes
                 .filter(p => (p.name || '').toLowerCase() !== 'wall')
                 .map(p => (
@@ -248,10 +363,9 @@ export default function Board() {
                       }}
                       title={p.name ?? ''}
                     />
-                    {/* X 버튼은 셀 바깥 모서리 */}
                     <button
                       onClick={() => deletePalette(p.id)}
-                      className="absolute top-0 right-0 translate-x-1/2 -translate-y-1/2 w-6 h-6 rounded-full bg-rose-600 text-white text-xs font-bold shadow"
+                      className="absolute -top-2 -right-2 w-7 h-7 rounded-full bg-rose-600 text-white text-xs font-bold shadow"
                       title="삭제"
                     >
                       ×
@@ -259,6 +373,7 @@ export default function Board() {
                   </div>
                 ))}
             </div>
+            <div className="h-2" />
           </div>
         </div>
       </aside>
