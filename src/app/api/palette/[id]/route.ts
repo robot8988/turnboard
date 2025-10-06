@@ -1,3 +1,5 @@
+// src/app/api/palette/[id]/route.ts
+
 // ✅ 항상 Node 런타임 + 동적 처리 + 캐시 금지
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -6,12 +8,14 @@ export const revalidate = 0;
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
+type Ctx = { params: Promise<{ id: string }> };
+
 function jsonError(message: string, status = 500) {
   // 절대 HTML을 내지 않고 JSON만 반환
   return NextResponse.json({ ok: false, error: message }, { status });
 }
 
-export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
+export async function DELETE(_req: Request, { params }: Ctx) {
   try {
     // 🔐 환경변수 점검 (없으면 바로 JSON 에러 반환)
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -21,7 +25,7 @@ export async function DELETE(_req: Request, { params }: { params: { id: string }
 
     const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    const id = params.id;
+    const { id } = await params;          // ✅ 변경: await params
     if (!id) return jsonError('Missing palette id', 400);
 
     // 1) 이 팔레트를 사용 중인 보드 셀 참조 끊기
@@ -31,9 +35,9 @@ export async function DELETE(_req: Request, { params }: { params: { id: string }
       .eq('palette_id', id);
     if (e1) return jsonError(`board_cells update failed: ${e1.message}`, 500);
 
-    // 2) 팔레트 행 삭제
+    // 2) 팔레트 삭제
     const { error: e2 } = await supabase
-      .from('palette')
+      .from('palettes')
       .delete()
       .eq('id', id);
     if (e2) return jsonError(`palette delete failed: ${e2.message}`, 500);
@@ -45,7 +49,7 @@ export async function DELETE(_req: Request, { params }: { params: { id: string }
   }
 }
 
-// (선택) GET 프로브: http://localhost:3000/api/palette/test 열면 JSON 떠야 정상
-export async function GET(_req: Request, { params }: { params: { id: string } }) {
-  return NextResponse.json({ ok: true, id: params.id });
+// (선택) GET 프로브: http://localhost:3000/api/palette/TEST
+export async function GET(_req: Request, { params }: Ctx) {
+  return NextResponse.json({ ok: true, id: (await params).id });  // ✅ 변경: await params
 }
