@@ -15,7 +15,7 @@ type Cell = {
 const CELL = 72;
 const BOARD_W = 9 * CELL + 16 + 4;
 
-// ✅ 모드/선택을 분리해서 타입 충돌 제거
+// 모드
 type Mode = 'wall' | 'reset' | 'image';
 
 export default function Board() {
@@ -29,7 +29,7 @@ export default function Board() {
   const [paint, setPaint] = useState<Record<number, 'wall' | 'reset' | { url: string }>>({});
   const [rt, setRt] = useState<RealtimeChannel | null>(null);
 
-  // 유틸
+  // 유틸: 단일 셀 재조회
   async function refetchCell(id: number) {
     const { data, error } = await supabase
       .from('board_cells')
@@ -47,7 +47,7 @@ export default function Board() {
     }
   }
 
-  // ✅ WALL 팔레트 id 준비
+  // WALL 팔레트 id 준비
   useEffect(() => {
     (async () => {
       try {
@@ -93,16 +93,29 @@ export default function Board() {
           if (prev.some(c => c.id === n.id)) return prev;
           return [...prev, n].sort((a,b)=> a.y-b.y || a.x-b.x);
         });
+        // 다른 탭에서 들어온 신규 셀은 낙관 페인트 없음
         refetchCell(n.id);
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'board_cells' }, (p) => {
         const n = p.new as any as Cell;
+        // ✅ 실시간 반영 방해 요소 제거: 해당 셀의 낙관 페인트 제거
+        setPaint(prev => {
+          if (!(n.id in prev)) return prev;
+          const { [n.id]: _omit, ...rest } = prev;
+          return rest;
+        });
         refetchCell(n.id);
       })
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'board_cells' }, (p) => {
-        const oldId = (p.old as any)?.id;
+        const oldId = (p.old as any)?.id as number | undefined;
         if (!oldId) return;
         setCells(prev => prev.filter(c => c.id !== oldId));
+        // ✅ 삭제 시에도 낙관 페인트 제거
+        setPaint(prev => {
+          if (!(oldId in prev)) return prev;
+          const { [oldId]: _omit, ...rest } = prev;
+          return rest;
+        });
       })
       .subscribe();
 
@@ -147,6 +160,12 @@ export default function Board() {
 
     ch.on('broadcast', { event: 'cell:update' }, (msg) => {
       const { id } = msg.payload as any;
+      // ✅ 브로드캐스트 수신 시 낙관 페인트 제거 후 재조회
+      setPaint(prev => {
+        if (!(id in prev)) return prev;
+        const { [id]: _omit, ...rest } = prev;
+        return rest;
+      });
       refetchCell(id);
     });
 
@@ -171,22 +190,6 @@ export default function Board() {
       return { id: -1 - i, x, y, palette_id: null, palette: null } as Cell;
     });
   }, [cells]);
-
-  const isEdge = (x: number, y: number) => (x === 0 || y === 0 || x === 8 || y === 8);
-
-  // 가장자리 자동 WALL 채우기
-  useEffect(() => {
-    (async () => {
-      if (!cells.length || !wallId) return;
-      const edgeIds = cells.filter(c => isEdge(c.x, c.y) && !c.palette_id).map(c => c.id);
-      if (edgeIds.length === 0) return;
-      const { error } = await supabase
-        .from('board_cells')
-        .update({ palette_id: wallId })
-        .in('id', edgeIds);
-      if (error) setErr(error.message);
-    })();
-  }, [cells, wallId]);
 
   // 셀 클릭
   async function onCellClick(cell: Cell) {
