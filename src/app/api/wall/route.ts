@@ -2,15 +2,30 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
 export async function GET() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const key = process.env.SUPABASE_SERVICE_ROLE!;
-  const sb = createClient(url, key);
+  try {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE!;
+    const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-  const { data } = await sb.from('palette').select('id,name').ilike('name', 'wall').limit(1).maybeSingle();
-  if (data) return NextResponse.json({ id: data.id });
+    // WALL 행 조회
+    const { data: found, error: e1 } = await supabase
+      .from('palette')
+      .select('id,name,image_url')
+      .ilike('name', 'wall')
+      .maybeSingle();
+    if (e1) throw e1;
+    if (found) return NextResponse.json({ id: found.id });
 
-  const ins = await sb.from('palette').insert({ name: 'WALL', image_url: null }).select('id').single();
-  if (ins.error) return NextResponse.json({ error: ins.error.message }, { status: 500 });
+    // 없으면 생성 (이미지 없이 name=WALL)
+    const { data: created, error: e2 } = await supabase
+      .from('palette')
+      .insert({ name: 'WALL', image_url: null })
+      .select('id')
+      .single();
+    if (e2) throw e2;
 
-  return NextResponse.json({ id: ins.data.id });
+    return NextResponse.json({ id: created.id });
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: e.message ?? String(e) }, { status: 500 });
+  }
 }

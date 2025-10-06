@@ -15,6 +15,7 @@ type Cell = {
 const CELL = 72;
 const BOARD_W = 9 * CELL + 16 + 4;
 
+// ✅ wall 모드까지 포함한 선택 상태 유니온 타입
 type Selected =
   | { kind: 'wall'; wallId: string | null }
   | { kind: 'reset' }
@@ -28,7 +29,7 @@ export default function Board() {
   const [paint, setPaint] = useState<Record<number, 'wall' | 'reset' | { url: string }>>({});
   const [rt, setRt] = useState<RealtimeChannel | null>(null); // broadcast
 
-  // 유틸: 셀 1개 재조회(조인 포함)
+  // 개별 셀 재조회(조인 포함)
   async function refetchCell(id: number) {
     const { data, error } = await supabase
       .from('board_cells')
@@ -46,7 +47,7 @@ export default function Board() {
     }
   }
 
-  // WALL id 확보
+  // ✅ WALL id 확보 (없으면 서버가 생성)
   useEffect(() => {
     (async () => {
       try {
@@ -82,13 +83,12 @@ export default function Board() {
     return () => { alive = false; };
   }, []);
 
-  // DB Realtime – 보드 셀 (조인 정보가 없으므로 해당 셀만 재조회)
+  // DB Realtime – 보드 셀
   useEffect(() => {
     const chCells = supabase
       .channel('cells')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'board_cells' }, (p) => {
         const n = p.new as any as Cell;
-        // 새로 생긴 셀은 바로 반영(조인 필요 없으면 그대로, 필요하면 refetch)
         setCells(prev => {
           if (prev.some(c => c.id === n.id)) return prev;
           return [...prev, n].sort((a,b)=> a.y-b.y || a.x-b.x);
@@ -97,7 +97,6 @@ export default function Board() {
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'board_cells' }, (p) => {
         const n = p.new as any as Cell;
-        // UPDATE는 조인 정보가 없음 → 해당 행만 재조회하여 확정 반영
         refetchCell(n.id);
       })
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'board_cells' }, (p) => {
@@ -107,18 +106,17 @@ export default function Board() {
       })
       .subscribe();
 
-    // DB Realtime – 팔레트(업로드/삭제/수정 시 목록 갱신)
+    // DB Realtime – 팔레트
     const chPal = supabase
       .channel('palettes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'palette' }, async (p) => {
-        // 목록 갱신
         const { data } = await supabase
           .from('palette')
           .select('id,name,image_url')
           .order('created_at', { ascending: false });
         setPalettes((data ?? []) as any);
 
-        // 팔레트가 삭제되거나 이미지 경로가 사라진 경우, 해당 팔레트를 쓰던 셀들을 즉시 리렌더
+        // ✅ 팔레트 삭제/이미지 비움 즉시 반영
         if (p.eventType === 'DELETE') {
           const deletedId = (p.old as any)?.id as string | undefined;
           if (deletedId) {
@@ -128,7 +126,6 @@ export default function Board() {
         if (p.eventType === 'UPDATE') {
           const after = p.new as any;
           if (!after?.image_url) {
-            // 이미지가 비워졌다면 그 팔레트를 쓰는 셀들의 표시도 흰색으로
             const pid = after?.id as string | undefined;
             if (pid) {
               setCells(prev => prev.map(c => c.palette_id === pid ? { ...c, palette: { name: after?.name ?? null, image_url: null } } : c));
@@ -144,13 +141,12 @@ export default function Board() {
     };
   }, []);
 
-  // Broadcast – 탭 간 초즉시 반영
+  // Broadcast – 탭 간 반영
   useEffect(() => {
     const ch = supabase.channel('board-sync', { config: { broadcast: { self: false } } });
 
     ch.on('broadcast', { event: 'cell:update' }, (msg) => {
       const { id } = msg.payload as any;
-      // 브로드캐스트 수신 시에도 해당 셀을 재조회(조인 포함) → 확정 반영
       refetchCell(id);
     });
 
@@ -252,25 +248,20 @@ export default function Board() {
   async function deletePalette(id: string) {
     const ok = confirm('이 이미지를 팔레트에서 삭제할까요? (보드에서 사용 중인 셀은 흰색으로 바뀝니다)');
     if (!ok) return;
-   
+
     try {
       const res = await fetch(`/api/palette/${id}`, {
         method: 'DELETE',
-        headers: { 'Accept': 'application/json' }, // JSON 기대를 명시
+        headers: { 'Accept': 'application/json' },
       });
-  
-      // JSON이 아닐 수도 있으니 안전 파싱
+
       const text = await res.text();
       let json: any = null;
       try { json = JSON.parse(text); } catch {
-        // 서버가 HTML(<!DOCTYPE …)을 돌려준 상황 → 에러로 처리
         throw new Error(`API ${res.status}: ${text.slice(0, 200)}`);
       }
-      if (!res.ok || json?.ok === false) {
-        throw new Error(json?.error || `API ${res.status}`);
-      }
-  
-      // 성공: 로컬/다른 탭 반영
+      if (!res.ok || json?.ok === false) throw new Error(json?.error || `API ${res.status}`);
+
       setPalettes(prev => prev.filter(p => p.id !== id));
       setCells(prev => prev.map(c => c.palette_id === id ? ({ ...c, palette_id: null, palette: null }) : c));
       rt?.send({ type: 'broadcast', event: 'palette:list:refresh', payload: { at: Date.now() }});
@@ -278,7 +269,6 @@ export default function Board() {
       alert(`삭제 실패: ${e.message}`);
     }
   }
-
 
   // 업로드 직후 즉시 반영
   function handleUploaded(p: UploadedPalette) {
@@ -326,8 +316,13 @@ export default function Board() {
           </div>
 
           <div className="grid grid-cols-2 gap-4 mb-4">
+            {/* ✅ 깔끔한 토글: wall ↔ 유지 */}
             <button
-              onClick={() => setSel({ kind: 'wall', wallId: sel.kind === 'wall' ? sel.wallId : (sel as any).wallId ?? sel.wallId })}
+              onClick={() =>
+                setSel(prev => prev.kind === 'wall'
+                  ? { ...prev }
+                  : { kind: 'wall', wallId: sel.kind === 'wall' ? sel.wallId : (sel as any)?.wallId ?? sel.wallId ?? null })
+              }
               className={`rounded-md border flex items-center justify-center text-lg font-semibold ${sel.kind==='wall' ? 'ring-2 ring-black' : ''}`}
               style={{ width: CELL, height: CELL, backgroundColor:'#111827', color:'#ffffff' }}
               title="가장자리/벽 칠하기"
