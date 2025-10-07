@@ -13,13 +13,14 @@ type Cell = {
 };
 
 const CELL = 72;
-const BOARD_W = 9 * CELL + 16 + 4;
+const SIZE = 11;            // ✅ 11x11
+const GAP = 2;
+const PAD = 2;
+const BOARD_W = SIZE * CELL + (SIZE - 1) * GAP + PAD * 2;
 
-// 모드
 type Mode = 'wall' | 'reset' | 'image';
 
 export default function Board() {
-  // 상태
   const [cells, setCells] = useState<Cell[]>([]);
   const [palettes, setPalettes] = useState<DBPalette[]>([]);
   const [mode, setMode] = useState<Mode>('wall');
@@ -28,8 +29,9 @@ export default function Board() {
   const [err, setErr] = useState<string>();
   const [paint, setPaint] = useState<Record<number, 'wall' | 'reset' | { url: string }>>({});
   const [rt, setRt] = useState<RealtimeChannel | null>(null);
+  const [lastPlacedId, setLastPlacedId] = useState<number | null>(null);
 
-  // 유틸: 단일 셀 재조회
+  // 단일 셀 재조회
   async function refetchCell(id: number) {
     const { data, error } = await supabase
       .from('board_cells')
@@ -47,7 +49,7 @@ export default function Board() {
     }
   }
 
-  // WALL 팔레트 id 준비
+  // WALL 팔레트 id
   useEffect(() => {
     (async () => {
       try {
@@ -93,12 +95,10 @@ export default function Board() {
           if (prev.some(c => c.id === n.id)) return prev;
           return [...prev, n].sort((a,b)=> a.y-b.y || a.x-b.x);
         });
-        // 다른 탭에서 들어온 신규 셀은 낙관 페인트 없음
         refetchCell(n.id);
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'board_cells' }, (p) => {
         const n = p.new as any as Cell;
-        // ✅ 실시간 반영 방해 요소 제거: 해당 셀의 낙관 페인트 제거
         setPaint(prev => {
           if (!(n.id in prev)) return prev;
           const { [n.id]: _omit, ...rest } = prev;
@@ -110,7 +110,6 @@ export default function Board() {
         const oldId = (p.old as any)?.id as number | undefined;
         if (!oldId) return;
         setCells(prev => prev.filter(c => c.id !== oldId));
-        // ✅ 삭제 시에도 낙관 페인트 제거
         setPaint(prev => {
           if (!(oldId in prev)) return prev;
           const { [oldId]: _omit, ...rest } = prev;
@@ -119,7 +118,6 @@ export default function Board() {
       })
       .subscribe();
 
-    // Realtime: palettes
     const chPal = supabase
       .channel('palettes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'palette' }, async (p) => {
@@ -129,7 +127,6 @@ export default function Board() {
           .order('created_at', { ascending: false });
         setPalettes((data ?? []) as any);
 
-        // 삭제/이미지 공백 즉시 반영
         if (p.eventType === 'DELETE') {
           const deletedId = (p.old as any)?.id as string | undefined;
           if (deletedId) {
@@ -154,13 +151,13 @@ export default function Board() {
     };
   }, []);
 
-  // Broadcast – 탭 간 반영
+  // Broadcast – 탭 간 동기화
   useEffect(() => {
     const ch = supabase.channel('board-sync', { config: { broadcast: { self: false } } });
 
     ch.on('broadcast', { event: 'cell:update' }, (msg) => {
       const { id } = msg.payload as any;
-      // ✅ 브로드캐스트 수신 시 낙관 페인트 제거 후 재조회
+      setLastPlacedId(id); // ✅ 수신자도 강조
       setPaint(prev => {
         if (!(id in prev)) return prev;
         const { [id]: _omit, ...rest } = prev;
@@ -182,71 +179,97 @@ export default function Board() {
     return () => { supabase.removeChannel(ch); };
   }, []);
 
-  // 9x9 기본 그리드(초기 로딩 보임)
+  // ✅ 항상 11×11 전칸을 그리되, DB에 있는 칸은 덮어씌움
   const grid = useMemo(() => {
-    if (cells.length) return [...cells];
-    return Array.from({ length: 81 }).map((_, i) => {
-      const x = i % 9, y = Math.floor(i / 9);
-      return { id: -1 - i, x, y, palette_id: null, palette: null } as Cell;
+    const byKey = new Map<string, Cell>();
+    for (const c of cells) byKey.set(`${c.x},${c.y}`, c);
+
+    return Array.from({ length: SIZE * SIZE }).map((_, i) => {
+      const x = i % SIZE, y = Math.floor(i / SIZE);
+      return byKey.get(`${x},${y}`) ?? { id: -1 - i, x, y, palette_id: null, palette: null };
     });
   }, [cells]);
 
-  // 셀 클릭
+  // 클릭 처리: DB가 없던 칸이면 생성 후 반영
   async function onCellClick(cell: Cell) {
     setPaint(p => ({
       ...p,
-      [cell.id]: mode === 'image'
-        ? { url: imageSel?.url || '' }
-        : mode
+      [cell.id]: mode === 'image' ? { url: imageSel?.url || '' } : mode
     }));
-    if (cell.id < 0) return;
+
+    // 선택된 팔레트
+    let nextPaletteId: string | null = null;
+    if (mode === 'wall') nextPaletteId = wallId ?? null;
+    if (mode === 'image') nextPaletteId = imageSel?.id ?? null;
+    if (mode === 'reset') nextPaletteId = null;
 
     try {
+      // DB 행이 없던 칸(음수 id) → 생성하면서 값 반영
+      if (cell.id < 0) {
+        const { data, error } = await supabase
+          .from('board_cells')
+          .insert({ x: cell.x, y: cell.y, palette_id: nextPaletteId })
+          .select('id')
+          .single();
+        if (error) throw error;
+        const newId = (data as any)?.id as number;
+        setLastPlacedId(newId);
+        rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: newId }});
+        await refetchCell(newId);
+        return;
+      }
+
+      // 기존 칸 업데이트
       if (mode === 'reset') {
         const { error } = await supabase.from('board_cells').update({ palette_id: null }).eq('id', cell.id);
         if (error) throw error;
-      } else if (mode === 'wall') {
-        if (!wallId) return;
-        const { error } = await supabase.from('board_cells').update({ palette_id: wallId }).eq('id', cell.id);
-        if (error) throw error;
-      } else { // image
-        if (!imageSel) return;
-        const { error } = await supabase.from('board_cells').update({ palette_id: imageSel.id }).eq('id', cell.id);
+      } else {
+        const { error } = await supabase.from('board_cells').update({ palette_id: nextPaletteId }).eq('id', cell.id);
         if (error) throw error;
       }
+
+      setLastPlacedId(cell.id); // 본인 화면 강조
       rt?.send({ type: 'broadcast', event: 'cell:update', payload: { id: cell.id }});
-    } catch (e:any) { setErr(e.message || '업데이트 실패'); }
+    } catch (e:any) {
+      setErr(e.message || '업데이트 실패');
+    }
   }
 
-  // 렌더 스타일
+  // 스타일
   function cellStyle(cell: Cell): React.CSSProperties {
+    const base: React.CSSProperties = { width: CELL, height: CELL, position: 'relative' };
     const p = paint[cell.id];
+    let bg: React.CSSProperties = {};
+
     if (p) {
-      if (p === 'reset') return { width: CELL, height: CELL, backgroundColor: '#ffffff' };
-      if (p === 'wall')  return { width: CELL, height: CELL, backgroundColor: '#111827' };
-      return {
-        width: CELL, height: CELL,
+      if (p === 'reset') bg = { backgroundColor: '#ffffff' };
+      else if (p === 'wall') bg = { backgroundColor: '#111827' };
+      else bg = {
         backgroundImage: `url(${(p as any).url})`,
         backgroundRepeat: 'no-repeat',
         backgroundSize: 'cover',
         backgroundPosition: 'center',
         backgroundColor: '#ffffff',
       };
-    }
-    if (cell.palette?.name?.toLowerCase() === 'wall') {
-      return { width: CELL, height: CELL, backgroundColor: '#111827' };
-    }
-    if (cell.palette?.image_url) {
-      return {
-        width: CELL, height: CELL,
+    } else if (cell.palette?.name?.toLowerCase() === 'wall') {
+      bg = { backgroundColor: '#111827' };
+    } else if (cell.palette?.image_url) {
+      bg = {
         backgroundImage: `url(${cell.palette.image_url})`,
         backgroundRepeat: 'no-repeat',
         backgroundSize: 'cover',
         backgroundPosition: 'center',
         backgroundColor: '#ffffff',
       };
+    } else {
+      bg = { backgroundColor: '#ffffff' };
     }
-    return { width: CELL, height: CELL, backgroundColor: '#ffffff' };
+
+    const highlight = (lastPlacedId === cell.id)
+      ? { boxShadow: 'inset 0 0 0 4px rgba(34,197,94,0.95), 0 0 0 2px rgba(34,197,94,1)', transition: 'box-shadow 0.15s ease' }
+      : null;
+
+    return { ...base, ...bg, ...(highlight || {}) };
   }
 
   // 팔레트 삭제
@@ -275,7 +298,6 @@ export default function Board() {
     }
   }
 
-  // 업로드 직후 반영
   function handleUploaded(p: UploadedPalette) {
     if (!p) return;
     setPalettes(prev => [p as DBPalette, ...prev]);
@@ -288,7 +310,7 @@ export default function Board() {
       <section className="flex-1">
         <div style={{ width: BOARD_W }} className="mx-auto">
           <h1 className="text-3xl font-extrabold mb-4 text-center">
-            &lt;3인용 어빌리티 4목 판&gt;
+            &lt;3~4인용 어빌리티 4목 판&gt;
           </h1>
 
           {err && (
@@ -297,14 +319,23 @@ export default function Board() {
             </div>
           )}
 
-          <div className="inline-grid grid-cols-9 gap-[2px] p-[2px] bg-neutral-400 rounded-md">
+          {/* ✅ 동적 클래스 대신 인라인 grid */}
+          <div
+            className="rounded-md bg-neutral-400"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: `repeat(${SIZE}, ${CELL}px)`,
+              gap: `${GAP}px`,
+              padding: `${PAD}px`,
+            }}
+          >
             {grid.map(cell => (
               <button
-                key={`${cell.id}-${cell.x}-${cell.y}`}
+                key={`${cell.x},${cell.y}`}   // ✅ 좌표를 키로: 위치 일관성
                 onClick={() => onCellClick(cell)}
                 className="relative border border-neutral-300/60"
                 style={cellStyle(cell)}
-                title={`${cell.x},${cell.y}`}
+                title={`${cell.x},${cell.y}`}  // ✅ 마우스오버 좌표 정확
               />
             ))}
           </div>
